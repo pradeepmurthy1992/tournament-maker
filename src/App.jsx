@@ -540,8 +540,9 @@ export default function TournamentMaker() {
       <section className="relative rounded-2xl overflow-hidden border mb-4 min-h-[25vh] flex items-center" style={{borderColor: TM_BLUE}}>
         <div className="relative p-6 md:p-8 w-full gpGroup">
           <h1 className="text-5xl md:text-7xl lg:text-8xl font-extrabold tracking-widest text-center select-none">
-            <span className="gp3d bg-clip-text text-transparent" style={{backgroundImage:`linear-gradient(90deg, ${TM_CYAN}, white)`}}>GAME</span>
-            <span className="gp3d ml-2 bg-clip-text text-transparent" style={{backgroundImage:`linear-gradient(90deg, white, ${TM_BLUE})`}}>PORT</span>
+            {/* CHANGED: Solid white text for GAMEPORT */}
+            <span className="gp3d" style={{color:'#ffffff'}}>GAME</span>
+            <span className="gp3d ml-2" style={{color:'#ffffff'}}>PORT</span>
           </h1>
         </div>
       </section>
