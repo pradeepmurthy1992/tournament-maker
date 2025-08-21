@@ -1,0 +1,13 @@
+.gameport-title {
+  font-size: 4rem;
+  font-weight: 900;
+  color: #fff; /* white text */
+  text-shadow:
+    2px 2px 0 #1e3a8a,
+    4px 4px 0 #0f172a;
+  transition: transform 0.2s ease;
+}
+
+.gameport-title:hover {
+  transform: translateY(-2px);
+}
