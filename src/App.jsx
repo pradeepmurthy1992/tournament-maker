@@ -1,3 +1,4 @@
+// src/App.jsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 
@@ -5,8 +6,7 @@ import * as XLSX from "xlsx";
  * Tournament Maker — Cloud (GitHub via Cloudflare Worker) + 4 Seeds + Printable Bracket + Safe Delete
  * Tabs: SCHEDULE (admin), FIXTURES, STANDINGS, WINNERS, DELETED (admin-only)
  *
- * Cloud save/load is proxied through a Worker (see worker code below).
- * Set CLOUD_STORE_URL and CLOUD_APP_KEY before building.
+ * Cloud save/load is proxied through a Worker (see worker code). Set CLOUD_STORE_URL and CLOUD_APP_KEY.
  */
 
 // ----------------------------- Theme -----------------------------
@@ -223,6 +223,81 @@ function Bracket({ tournament }) {
         }
       `}</style>
     </div>
+  );
+}
+
+// ----------------------------- Card Component (fixes Hooks-in-loop) -----------------------------
+function TournamentCard({
+  tn,
+  isAdmin,
+  stageLabelByCount,
+  roundCounts,
+  maxRound,
+  canGenerateNext,
+  pickWinner,
+  generateNextRound,
+  openDelete
+}) {
+  const [showBracket, setShowBracket] = useState(false);
+  const counts = roundCounts(tn);
+  const mr = maxRound(tn);
+  const canNext = canGenerateNext(tn);
+  const teamMap = Object.fromEntries(tn.teams.map(tm => [tm.id, tm.name]));
+
+  return (
+    <Collapsible
+      key={tn.id}
+      title={tn.name}
+      subtitle={`Active • ${tn.teams.length} players`}
+      right={
+        <div className="flex items-center gap-2">
+          {isAdmin && (
+            <button
+              className="px-2 py-1 rounded border border-red-400 text-red-300 hover:bg-red-400 hover:text-black"
+              onClick={() => openDelete(tn)}
+              title="Delete tournament"
+            >Delete</button>
+          )}
+          <span className="text-xs text-white/70">Current: {stageLabelByCount(counts.get(mr)) || `Round ${mr}`}</span>
+          <button
+            className="px-3 py-2 rounded-xl border transition border-white hover:bg-white hover:text-black"
+            onClick={() => setShowBracket(v => !v)}
+          >
+            {showBracket ? 'List View' : 'Bracket View'}
+          </button>
+          {isAdmin && (
+            <button
+              className={`px-3 py-2 rounded-xl border transition ${canNext ? "border-white hover:bg-white hover:text-black" : "border-zinc-700 text-zinc-500 cursor-not-allowed"}`}
+              disabled={!canNext}
+              onClick={() => generateNextRound(tn.id)}
+            >Generate Next Round</button>
+          )}
+          <button
+            className="px-3 py-2 rounded-xl border transition border-white hover:bg-white hover:text-black no-print"
+            onClick={() => window.print()}
+          >Print</button>
+        </div>
+      }
+      defaultOpen={true}
+    >
+      {!showBracket ? (
+        <div className="divide-y" style={{ borderColor: 'rgba(255,255,255,0.08)' }}>
+          {tn.matches.map((m, i) => (
+            <MatchRow
+              key={m.id}
+              idx={i + 1}
+              m={m}
+              teamMap={teamMap}
+              stageText={stageLabelByCount(roundCounts(tn).get(m.round)) || `Round ${m.round}`}
+              onPickWinner={(mid, wid) => isAdmin ? pickWinner(tn.id, mid, wid) : null}
+              canEdit={isAdmin}
+            />
+          ))}
+        </div>
+      ) : (
+        <Bracket tournament={tn} />
+      )}
+    </Collapsible>
   );
 }
 
@@ -756,46 +831,20 @@ export default function TournamentMaker() {
             <p className="text-white/80 text-sm">No active tournaments. {isAdmin ? <>Create one from <b>SCHEDULE</b>.</> : <>Ask an admin to create one.</>}</p>
           )}
 
-          {activeTournaments.map(tn => {
-            const mr = maxRound(tn);
-            const counts = roundCounts(tn);
-            const canNext = canGenerateNext(tn);
-            const teamMap = Object.fromEntries(tn.teams.map(tm => [tm.id, tm.name]));
-
-            const [showBracket, setShowBracket] = useState(false);
-
-            return (
-              <Collapsible key={tn.id} title={tn.name} subtitle={`Active • ${tn.teams.length} players`} right={
-                <div className="flex items-center gap-2">
-                  {isAdmin && <button className="px-2 py-1 rounded border border-red-400 text-red-300 hover:bg-red-400 hover:text-black" onClick={() => openDelete(tn)} title="Delete tournament">Delete</button>}
-                  <span className="text-xs text-white/70">Current: {stageLabelByCount(counts.get(mr)) || `Round ${mr}`}</span>
-                  <button className="px-3 py-2 rounded-xl border transition border-white hover:bg-white hover:text-black" onClick={() => { setShowBracket(v => !v); }}>{showBracket ? 'List View' : 'Bracket View'}</button>
-                  {isAdmin && (
-                    <button className={`px-3 py-2 rounded-xl border transition ${canNext ? "border-white hover:bg-white hover:text-black" : "border-zinc-700 text-zinc-500 cursor-not-allowed"}`} disabled={!canNext} onClick={() => generateNextRound(tn.id)}>Generate Next Round</button>
-                  )}
-                  <button className="px-3 py-2 rounded-xl border transition border-white hover:bg-white hover:text-black no-print" onClick={() => window.print()}>Print</button>
-                </div>
-              } defaultOpen={true}>
-                {!showBracket ? (
-                  <div className="divide-y" style={{ borderColor: 'rgba(255,255,255,0.08)' }}>
-                    {tn.matches.map((m, i) => (
-                      <MatchRow
-                        key={m.id}
-                        idx={i + 1}
-                        m={m}
-                        teamMap={teamMap}
-                        stageText={stageLabelByCount(roundCounts(tn).get(m.round)) || `Round ${m.round}`}
-                        onPickWinner={(mid, wid) => isAdmin ? pickWinner(tn.id, mid, wid) : null}
-                        canEdit={isAdmin}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <Bracket tournament={tn} />
-                )}
-              </Collapsible>
-            );
-          })}
+          {activeTournaments.map(tn => (
+            <TournamentCard
+              key={tn.id}
+              tn={tn}
+              isAdmin={isAdmin}
+              stageLabelByCount={stageLabelByCount}
+              roundCounts={roundCounts}
+              maxRound={maxRound}
+              canGenerateNext={canGenerateNext}
+              pickWinner={pickWinner}
+              generateNextRound={generateNextRound}
+              openDelete={openDelete}
+            />
+          ))}
         </section>
       )}
 
