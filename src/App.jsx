@@ -6,7 +6,10 @@ import * as XLSX from "xlsx";
  * Tournament Maker — Cloud (GitHub via Cloudflare Worker) + 4 Seeds + Printable Bracket + Safe Delete
  * Tabs: SCHEDULE (admin), FIXTURES, STANDINGS, WINNERS, DELETED (admin-only)
  *
- * Cloud save/load is proxied through a Worker (see worker code). Set CLOUD_STORE_URL and CLOUD_APP_KEY.
+ * This version adds:
+ * - ErrorBoundary to surface runtime errors (no more silent white screen)
+ * - Defensive guards around cloud/local data and iteration
+ * - Hooks-in-loop fix (separate TournamentCard component)
  */
 
 // ----------------------------- Theme -----------------------------
@@ -75,33 +78,68 @@ function stageLabelByCount(count) {
   return null;
 }
 
+// ----------------------------- Error Boundary -----------------------------
+function ErrorBoundary({ children }) {
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    const onError = (e) => setErr(e?.error || e?.message || String(e));
+    const onRejection = (e) => setErr(e?.reason || e?.message || String(e));
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
+  }, []);
+
+  if (err) {
+    return (
+      <div style={{padding:16, color:"#fff", background:"#1b1b1f", fontFamily:"ui-sans-serif, system-ui"}}>
+        <h2 style={{margin:"0 0 8px"}}>⚠️ App crashed</h2>
+        <pre style={{whiteSpace:"pre-wrap", background:"#111", padding:12, borderRadius:8, border:"1px solid #333"}}>
+{String(err && (err.stack || err.message || err))}
+        </pre>
+        <p style={{opacity:.8, marginTop:8}}>Open DevTools → Console for the full stack trace.</p>
+      </div>
+    );
+  }
+  return children;
+}
+
 // ----------------------------- Cloud I/O (Worker proxy) -----------------------------
 async function cloudLoad() {
-  if (!CLOUD_STORE_URL || CLOUD_STORE_URL.includes("YOUR_WORKER_SUBDOMAIN")) return null;
   try {
+    if (!CLOUD_STORE_URL || CLOUD_STORE_URL.includes("YOUR_WORKER_SUBDOMAIN") || !CLOUD_APP_KEY) {
+      return null; // skip cloud if not configured
+    }
     const res = await fetch(`${CLOUD_STORE_URL}/load`, { headers: { "X-App-Key": CLOUD_APP_KEY } });
-    if (!res.ok) throw new Error("load failed");
-    const json = await res.json();
-    if (json && json.ok) return json.data;
-    return null;
-  } catch {
-    return null;
-  }
+    if (!res.ok) return null;
+    const json = await res.json().catch(() => null);
+    if (!json || !json.ok || typeof json.data !== "object") return null;
+    const data = json.data;
+    if (!Array.isArray(data.tournaments)) data.tournaments = [];
+    if (!Array.isArray(data.deleted)) data.deleted = [];
+    return data;
+  } catch { return null; }
 }
 
 async function cloudSave({ tournaments, deleted }) {
-  if (!CLOUD_STORE_URL || CLOUD_STORE_URL.includes("YOUR_WORKER_SUBDOMAIN")) return false;
   try {
+    if (!CLOUD_STORE_URL || CLOUD_STORE_URL.includes("YOUR_WORKER_SUBDOMAIN") || !CLOUD_APP_KEY) {
+      return false; // local-only
+    }
     const res = await fetch(`${CLOUD_STORE_URL}/save`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-App-Key": CLOUD_APP_KEY },
-      body: JSON.stringify({ tournaments, deleted }),
+      body: JSON.stringify({
+        tournaments: Array.isArray(tournaments) ? tournaments : [],
+        deleted: Array.isArray(deleted) ? deleted : [],
+      }),
     });
-    const json = await res.json();
+    const json = await res.json().catch(() => null);
     return !!(json && json.ok);
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 // ----------------------------- UI Subcomponents -----------------------------
@@ -189,11 +227,11 @@ function MatchRow({ idx, m, teamMap, onPickWinner, stageText, canEdit }) {
 function Bracket({ tournament }) {
   const rounds = useMemo(() => {
     const mp = new Map();
-    for (const m of tournament.matches) { if (!mp.has(m.round)) mp.set(m.round, []); mp.get(m.round).push(m); }
+    for (const m of (tournament.matches || [])) { if (!mp.has(m.round)) mp.set(m.round, []); mp.get(m.round).push(m); }
     return Array.from(mp.entries()).sort((a, b) => a[0] - b[0]);
   }, [tournament.matches]);
 
-  const teamMap = Object.fromEntries(tournament.teams.map(t => [t.id, t.name]));
+  const teamMap = Object.fromEntries((tournament.teams || []).map(t => [t.id, t.name]));
 
   return (
     <div className="bracket">
@@ -226,7 +264,7 @@ function Bracket({ tournament }) {
   );
 }
 
-// ----------------------------- Card Component (fixes Hooks-in-loop) -----------------------------
+// ----------------------------- Card Component -----------------------------
 function TournamentCard({
   tn,
   isAdmin,
@@ -242,13 +280,13 @@ function TournamentCard({
   const counts = roundCounts(tn);
   const mr = maxRound(tn);
   const canNext = canGenerateNext(tn);
-  const teamMap = Object.fromEntries(tn.teams.map(tm => [tm.id, tm.name]));
+  const teamMap = Object.fromEntries((tn.teams || []).map(tm => [tm.id, tm.name]));
 
   return (
     <Collapsible
       key={tn.id}
       title={tn.name}
-      subtitle={`Active • ${tn.teams.length} players`}
+      subtitle={`Active • ${(tn.teams || []).length} players`}
       right={
         <div className="flex items-center gap-2">
           {isAdmin && (
@@ -282,7 +320,7 @@ function TournamentCard({
     >
       {!showBracket ? (
         <div className="divide-y" style={{ borderColor: 'rgba(255,255,255,0.08)' }}>
-          {tn.matches.map((m, i) => (
+          {(tn.matches || []).map((m, i) => (
             <MatchRow
               key={m.id}
               idx={i + 1}
@@ -343,7 +381,10 @@ export default function TournamentMaker() {
           const data = JSON.parse(stored);
           if (data && Array.isArray(data.tournaments)) setTournaments(data.tournaments);
           if (data && Array.isArray(data.deleted)) setDeletedTournaments(data.deleted);
-        } catch {}
+        } catch (e) {
+          console.warn("Corrupt local data, clearing:", e);
+          localStorage.removeItem(STORAGE_KEY);
+        }
       }
     })();
   }, []);
@@ -374,7 +415,7 @@ export default function TournamentMaker() {
   }
 
   // ------- Builder helpers -------
-  const builderTeamMap = useMemo(() => Object.fromEntries(builderTeams.map(tm => [tm.name, tm.id])), [builderTeams]);
+  const builderTeamMap = useMemo(() => Object.fromEntries((builderTeams || []).map(tm => [tm.name, tm.id])), [builderTeams]);
 
   function loadTeamsFromText() {
     if (!isAdmin) { alert("Admin only."); return; }
@@ -419,7 +460,7 @@ export default function TournamentMaker() {
   }
 
   function generateRound1Matches(teams, seedNames) {
-    const names = teams.map(x => x.name);
+    const names = (teams || []).map(x => x.name);
     let size = 1; while (size < names.length) size *= 2;
 
     let slots = placeSeeds(size, seedNames);
@@ -440,7 +481,7 @@ export default function TournamentMaker() {
     for (let i = 0; i < L; i++) { if (i < topFree.length) order.push(topFree[i]); if (i < botFree.length) order.push(botFree[i]); }
     let oi = 0; for (const name of shuffled) { while (oi < order.length && slots[order[oi]] !== null) oi++; if (oi >= order.length) break; slots[order[oi]] = name; oi++; }
 
-    const nameToId = Object.fromEntries(teams.map(tm => [tm.name, tm.id]));
+    const nameToId = Object.fromEntries((teams || []).map(tm => [tm.name, tm.id]));
     const matches = [];
     for (let i = 0; i < size; i += 2) {
       const aId = slots[i] ? nameToId[slots[i]] : null;
@@ -457,12 +498,12 @@ export default function TournamentMaker() {
     if (!isAdmin) { alert("Admin only."); return; }
 
     if (targetTournamentId !== NEW_TOURNEY_SENTINEL) {
-      const names = builderTeams.length ? builderTeams.map(b => b.name) : namesText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      const names = (builderTeams.length ? builderTeams.map(b => b.name) : namesText.split(/\r?\n/).map(s => s.trim()).filter(Boolean));
       applyEntriesToTournament(targetTournamentId, names);
       return;
     }
     if (!tName.trim()) { alert("Please enter a Tournament Name."); return; }
-    if (builderTeams.length < 2) { alert("Please add at least 2 entries."); return; }
+    if ((builderTeams || []).length < 2) { alert("Please add at least 2 entries."); return; }
 
     const chosenSeeds = [seed1, seed2, seed3, seed4].map(s => s && s.trim()).filter(Boolean);
     const uniqSeeds = uniqueNames(chosenSeeds);
@@ -470,7 +511,7 @@ export default function TournamentMaker() {
     if (uniqSeeds.some(s => !builderTeamMap[s])) { alert("Seeds must be from the added entries."); return; }
 
     const matches = generateRound1Matches(builderTeams, uniqSeeds.slice(0, 4));
-    const idsByName = Object.fromEntries(builderTeams.map(tm => [tm.name, tm.id]));
+    const idsByName = Object.fromEntries((builderTeams || []).map(tm => [tm.name, tm.id]));
     const seedTopId = idsByName[uniqSeeds[0]] || null; // #1
     const seedBottomId = idsByName[uniqSeeds[1]] || null; // #2
 
@@ -493,9 +534,9 @@ export default function TournamentMaker() {
   }
 
   // ------- Per-tournament derived helpers -------
-  function roundCounts(tn) { const mp = new Map(); for (const m of tn.matches) { if (!(m.aId || m.bId)) continue; mp.set(m.round, (mp.get(m.round) || 0) + 1); } return mp; }
-  function maxRound(tn) { return tn.matches.length ? Math.max(...tn.matches.map(m => m.round)) : 0; }
-  function currentRoundMatches(tn) { const mr = maxRound(tn); return tn.matches.filter(m => m.round === mr); }
+  function roundCounts(tn) { const mp = new Map(); for (const m of (tn.matches || [])) { if (!(m.aId || m.bId)) continue; mp.set(m.round, (mp.get(m.round) || 0) + 1); } return mp; }
+  function maxRound(tn) { const arr = (tn.matches || []); return arr.length ? Math.max(...arr.map(m => m.round)) : 0; }
+  function currentRoundMatches(tn) { const mr = maxRound(tn); return (tn.matches || []).filter(m => m.round === mr); }
   function canGenerateNext(tn) {
     const cur = currentRoundMatches(tn);
     if (!cur.length) return false;
@@ -507,7 +548,7 @@ export default function TournamentMaker() {
     if (!isAdmin) { alert("Admin only."); return; }
     setTournaments(prev => prev.map(tn => {
       if (tn.id !== tournamentId) return tn;
-      const matches = tn.matches.map(m => m.id === matchId ? { ...m, winnerId, status: winnerId ? "Final" : m.status } : m);
+      const matches = (tn.matches || []).map(m => m.id === matchId ? { ...m, winnerId, status: winnerId ? "Final" : m.status } : m);
       return { ...tn, matches };
     }));
   }
@@ -530,7 +571,7 @@ export default function TournamentMaker() {
         const bye = !aId || !bId; const winnerId = bye ? (aId || bId || null) : null;
         next.push({ id: uid(), round: nextRoundNo, aId, bId, status: bye ? "BYE" : "Scheduled", winnerId });
       }
-      return { ...tn, matches: [...tn.matches, ...next] };
+      return { ...tn, matches: [...(tn.matches || []), ...next] };
     }));
   }
 
@@ -543,15 +584,15 @@ export default function TournamentMaker() {
       const maxR = maxRound(tn);
       if (maxR > 1) { alert("Cannot add entries after the tournament has advanced beyond Round 1."); return tn; }
 
-      const existingNamesSet = new Set(tn.teams.map(t => t.name.toLowerCase()));
+      const existingNamesSet = new Set((tn.teams || []).map(t => t.name.toLowerCase()));
       const toAddNames = uniqueNames(newNames).filter(n => !existingNamesSet.has(n.toLowerCase()));
       if (toAddNames.length === 0) return tn;
 
       const newTeams = toAddNames.map(n => ({ id: uid(), name: n }));
-      const allTeams = [...tn.teams, ...newTeams];
+      const allTeams = [...(tn.teams || []), ...newTeams];
       const idByName = Object.fromEntries(allTeams.map(t => [t.name, t.id]));
 
-      let matches = tn.matches.map(m => ({ ...m }));
+      let matches = (tn.matches || []).map(m => ({ ...m }));
 
       // 1) Fill BYE/TBD slots in Round 1
       const r1_before = matches.filter(m => m.round === 1);
@@ -616,8 +657,8 @@ export default function TournamentMaker() {
   }
 
   // Partition
-  const activeTournaments = tournaments.filter(tn => tn.status === "active");
-  const completedTournaments = tournaments.filter(tn => tn.status === "completed");
+  const activeTournaments = (tournaments || []).filter(tn => tn.status === "active");
+  const completedTournaments = (tournaments || []).filter(tn => tn.status === "completed");
 
   // Safe Delete modal
   const [deleteModal, setDeleteModal] = useState({ open: false, tournamentId: null, name: "", pw: "" });
@@ -625,11 +666,11 @@ export default function TournamentMaker() {
   const closeDelete = () => setDeleteModal({ open: false, tournamentId: null, name: "", pw: "" });
   const confirmDelete = async () => {
     if (deleteModal.pw !== ADMIN_PASSWORD) { alert("Wrong password."); return; }
-    const tn = tournaments.find(t => t.id === deleteModal.tournamentId);
+    const tn = (tournaments || []).find(t => t.id === deleteModal.tournamentId);
     if (!tn) { closeDelete(); return; }
     const delEntry = { ...tn, deletedAt: Date.now() };
-    const newDeleted = [delEntry, ...deletedTournaments];
-    const newActive = tournaments.filter(t => t.id !== tn.id);
+    const newDeleted = [delEntry, ...(deletedTournaments || [])];
+    const newActive = (tournaments || []).filter(t => t.id !== tn.id);
     setDeletedTournaments(newDeleted);
     setTournaments(newActive);
     closeDelete();
@@ -644,322 +685,324 @@ export default function TournamentMaker() {
   `;
 
   return (
-    <div className="p-4 text-white min-h-screen pageBg" style={{ position: "relative", zIndex: 1, background: "#0a1020" }}>
-      <style>{gpStyles}</style>
+    <ErrorBoundary>
+      <div className="p-4 text-white min-h-screen pageBg" style={{ position: "relative", zIndex: 1, background: "#0a1020" }}>
+        <style>{gpStyles}</style>
 
-      {/* HERO HEADER */}
-      <section className="relative rounded-2xl overflow-hidden border mb-4 min-h-[20vh] flex items-center" style={{ borderColor: TM_BLUE }}>
-        <div className="relative p-6 md:p-8 w-full">
-          <h1 className="text-5xl md:text-7xl lg:text-8xl font-extrabold tracking-widest text-center select-none">
-            <span style={{ color: "#ffffff" }}>GAME</span>
-            <span className="ml-2" style={{ color: "#ffffff" }}>PORT</span>
-          </h1>
-        </div>
-      </section>
-
-      {/* Tabs / Actions */}
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex gap-2">
-          {isAdmin && <TabButton id="schedule" label="SCHEDULE" tab={tab} setTab={setTab} />}
-          <TabButton id="fixtures" label="FIXTURES" tab={tab} setTab={setTab} />
-          <TabButton id="standings" label="STANDINGS" tab={tab} setTab={setTab} />
-          <TabButton id="winners" label="WINNERS" tab={tab} setTab={setTab} />
-          {isAdmin && <TabButton id="deleted" label="DELETED" tab={tab} setTab={setTab} />}
-        </div>
-        <div className="flex gap-2 items-center">
-          {tab === "fixtures" && isAdmin && (
-            <button className="px-3 py-2 border rounded hover:opacity-90" style={{ borderColor: TM_BLUE }} onClick={persistAll}>Save</button>
-          )}
-          {!isAdmin ? (
-            <button className="px-3 py-2 border rounded hover:bg-white hover:text-black" style={{ borderColor: TM_BLUE }} onClick={() => setShowLogin(true)}>Admin Login</button>
-          ) : (
-            <button className="px-3 py-2 border rounded border-red-400 text-red-300 hover:bg-red-400 hover:text-black" onClick={handleLogout}>Logout</button>
-          )}
-        </div>
-      </div>
-
-      {/* Admin Login Modal */}
-      {showLogin && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="w-[90vw] max-w-sm border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="font-semibold">Admin Login</h3>
-              <button className="w-6 h-6 border border-white rounded text-xs hover:bg-white hover:text-black" onClick={() => setShowLogin(false)}>×</button>
-            </div>
-            <form onSubmit={handleLogin} className="space-y-3">
-              <div>
-                <label className="text-xs">Admin ID</label>
-                <input className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }} value={loginId} onChange={e => setLoginId(e.target.value)} placeholder="enter admin id" />
-              </div>
-              <div>
-                <label className="text-xs">Password</label>
-                <input type="password" className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }} value={loginPw} onChange={e => setLoginPw(e.target.value)} placeholder="password" />
-              </div>
-              <button type="submit" className="w-full px-4 py-2 border border-emerald-400 text-emerald-300 rounded hover:bg-emerald-400 hover:text-black">Login</button>
-              <p className="text-xs text-white/60">(Change admin ID & password in code before publishing.)</p>
-            </form>
+        {/* HERO HEADER */}
+        <section className="relative rounded-2xl overflow-hidden border mb-4 min-h-[20vh] flex items-center" style={{ borderColor: TM_BLUE }}>
+          <div className="relative p-6 md:p-8 w-full">
+            <h1 className="text-5xl md:text-7xl lg:text-8xl font-extrabold tracking-widest text-center select-none">
+              <span style={{ color: "#ffffff" }}>GAME</span>
+              <span className="ml-2" style={{ color: "#ffffff" }}>PORT</span>
+            </h1>
           </div>
-        </div>
-      )}
+        </section>
 
-      {/* Safe Delete Modal */}
-      {deleteModal.open && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="w-[90vw] max-w-sm border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="font-semibold">Delete “{deleteModal.name}”</h3>
-              <button className="w-6 h-6 border border-white rounded text-xs hover:bg-white hover:text-black" onClick={closeDelete}>×</button>
-            </div>
-            <p className="text-sm mb-3">Re-enter admin password to confirm deletion. The tournament will move to <b>DELETED</b> (admin-only).</p>
-            <input type="password" className="w-full field border rounded-xl p-2 focus:border-white outline-none mb-3" style={{ borderColor: TM_BLUE }} value={deleteModal.pw} onChange={e => setDeleteModal(d => ({ ...d, pw: e.target.value }))} placeholder="admin password" />
-            <div className="flex justify-end gap-2">
-              <button className="px-3 py-2 border rounded" onClick={closeDelete}>Cancel</button>
-              <button className="px-3 py-2 border rounded border-red-400 text-red-300 hover:bg-red-400 hover:text-black" onClick={confirmDelete}>Delete</button>
-            </div>
+        {/* Tabs / Actions */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex gap-2">
+            {isAdmin && <TabButton id="schedule" label="SCHEDULE" tab={tab} setTab={setTab} />}
+            <TabButton id="fixtures" label="FIXTURES" tab={tab} setTab={setTab} />
+            <TabButton id="standings" label="STANDINGS" tab={tab} setTab={setTab} />
+            <TabButton id="winners" label="WINNERS" tab={tab} setTab={setTab} />
+            {isAdmin && <TabButton id="deleted" label="DELETED" tab={tab} setTab={setTab} />}
           </div>
-        </div>
-      )}
-
-      {/* SCHEDULE (Admin-only) */}
-      {tab === "schedule" && (isAdmin ? (
-        <section className="grid md:grid-cols-2 gap-4">
-          <div className="border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
-            <h2 className="font-semibold mb-3">Tournament Setup</h2>
-            <label className="text-xs block mb-3">Tournament
-              <select
-                className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }}
-                value={targetTournamentId} onChange={e => setTargetTournamentId(e.target.value)}
-              >
-                <option value={NEW_TOURNEY_SENTINEL}>➕ Create New Tournament</option>
-                {tournaments.map(t => (<option key={t.id} value={t.id}>{t.name}</option>))}
-              </select>
-            </label>
-            {targetTournamentId === NEW_TOURNEY_SENTINEL && (
-              <label className="text-xs block mb-3">Tournament Name
-                <input className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }} value={tName} onChange={e => setTName(e.target.value)} placeholder="e.g., Office TT Cup — Aug 2025" />
-              </label>
+          <div className="flex gap-2 items-center">
+            {tab === "fixtures" && isAdmin && (
+              <button className="px-3 py-2 border rounded hover:opacity-90" style={{ borderColor: TM_BLUE }} onClick={persistAll}>Save</button>
             )}
+            {!isAdmin ? (
+              <button className="px-3 py-2 border rounded hover:bg-white hover:text-black" style={{ borderColor: TM_BLUE }} onClick={() => setShowLogin(true)}>Admin Login</button>
+            ) : (
+              <button className="px-3 py-2 border rounded border-red-400 text-red-300 hover:bg-red-400 hover:text-black" onClick={handleLogout}>Logout</button>
+            )}
+          </div>
+        </div>
 
-            <label className="text-xs block mb-2">Players (one per line)</label>
-            <textarea
-              className="w-full h-40 field border rounded p-2 mb-2" style={{ borderColor: TM_BLUE }}
-              placeholder={`Enter player names, one per line\nExample:\nAkhil\nDevi\nRahul\nMeera`}
-              value={namesText}
-              onChange={e => setNamesText(e.target.value)}
-            />
+        {/* Admin Login Modal */}
+        {showLogin && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+            <div className="w-[90vw] max-w-sm border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="font-semibold">Admin Login</h3>
+                <button className="w-6 h-6 border border-white rounded text-xs hover:bg-white hover:text-black" onClick={() => setShowLogin(false)}>×</button>
+              </div>
+              <form onSubmit={handleLogin} className="space-y-3">
+                <div>
+                  <label className="text-xs">Admin ID</label>
+                  <input className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }} value={loginId} onChange={e => setLoginId(e.target.value)} placeholder="enter admin id" />
+                </div>
+                <div>
+                  <label className="text-xs">Password</label>
+                  <input type="password" className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }} value={loginPw} onChange={e => setLoginPw(e.target.value)} placeholder="password" />
+                </div>
+                <button type="submit" className="w-full px-4 py-2 border border-emerald-400 text-emerald-300 rounded hover:bg-emerald-400 hover:text-black">Login</button>
+                <p className="text-xs text-white/60">(Change admin ID & password in code before publishing.)</p>
+              </form>
+            </div>
+          </div>
+        )}
 
-            <div className="flex items-center justify-between mb-2">
-              <div>
-                <input
-                  ref={uploadRef}
-                  type="file"
-                  accept=".csv,.xlsx,.xls"
-                  className="hidden"
-                  onChange={async (e) => {
-                    const f = e.target.files?.[0];
-                    await handlePlayersUpload(f);
-                    if (uploadRef.current) uploadRef.current.value = "";
-                  }}
-                />
-                <button
-                  className={`px-3 py-2 border rounded inline-flex items-center gap-2 ${targetTournamentId !== NEW_TOURNEY_SENTINEL ? 'border-zinc-700 text-zinc-500 cursor-not-allowed' : 'border-white hover:bg-white hover:text-black'}`}
-                  title="Upload Entry"
-                  onClick={() => { if (targetTournamentId === NEW_TOURNEY_SENTINEL && uploadRef.current) uploadRef.current.click(); }}
-                  disabled={targetTournamentId !== NEW_TOURNEY_SENTINEL}
+        {/* Safe Delete Modal */}
+        {deleteModal.open && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+            <div className="w-[90vw] max-w-sm border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="font-semibold">Delete “{deleteModal.name}”</h3>
+                <button className="w-6 h-6 border border-white rounded text-xs hover:bg-white hover:text-black" onClick={closeDelete}>×</button>
+              </div>
+              <p className="text-sm mb-3">Re-enter admin password to confirm deletion. The tournament will move to <b>DELETED</b> (admin-only).</p>
+              <input type="password" className="w-full field border rounded-xl p-2 focus:border-white outline-none mb-3" style={{ borderColor: TM_BLUE }} value={deleteModal.pw} onChange={e => setDeleteModal(d => ({ ...d, pw: e.target.value }))} placeholder="admin password" />
+              <div className="flex justify-end gap-2">
+                <button className="px-3 py-2 border rounded" onClick={closeDelete}>Cancel</button>
+                <button className="px-3 py-2 border rounded border-red-400 text-red-300 hover:bg-red-400 hover:text-black" onClick={confirmDelete}>Delete</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* SCHEDULE (Admin-only) */}
+        {tab === "schedule" && (isAdmin ? (
+          <section className="grid md:grid-cols-2 gap-4">
+            <div className="border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
+              <h2 className="font-semibold mb-3">Tournament Setup</h2>
+              <label className="text-xs block mb-3">Tournament
+                <select
+                  className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }}
+                  value={targetTournamentId} onChange={e => setTargetTournamentId(e.target.value)}
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4">
-                    <path d="M12 3a1 1 0 0 1 1 1v8.586l2.293-2.293a1 1 0 1 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4A1 1 0 1 1 8.707 10.293L11 12.586V4a1 1 0 0 1 1-1z"/>
-                    <path d="M4 15a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2H6v2h12v-2h-1a1 1 0 1 1 0-2h2a1 1 0 0 1 1 1v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4z"/>
-                  </svg>
-                  <span>Upload Entry</span>
+                  <option value={NEW_TOURNEY_SENTINEL}>➕ Create New Tournament</option>
+                  {(tournaments || []).map(t => (<option key={t.id} value={t.id}>{t.name}</option>))}
+                </select>
+              </label>
+              {targetTournamentId === NEW_TOURNEY_SENTINEL && (
+                <label className="text-xs block mb-3">Tournament Name
+                  <input className="w-full field border rounded-xl p-2 focus:border-white outline-none" style={{ borderColor: TM_BLUE }} value={tName} onChange={e => setTName(e.target.value)} placeholder="e.g., Office TT Cup — Aug 2025" />
+                </label>
+              )}
+
+              <label className="text-xs block mb-2">Players (one per line)</label>
+              <textarea
+                className="w-full h-40 field border rounded p-2 mb-2" style={{ borderColor: TM_BLUE }}
+                placeholder={`Enter player names, one per line\nExample:\nAkhil\nDevi\nRahul\nMeera`}
+                value={namesText}
+                onChange={e => setNamesText(e.target.value)}
+              />
+
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <input
+                    ref={uploadRef}
+                    type="file"
+                    accept=".csv,.xlsx,.xls"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const f = e.target.files?.[0];
+                      await handlePlayersUpload(f);
+                      if (uploadRef.current) uploadRef.current.value = "";
+                    }}
+                  />
+                  <button
+                    className={`px-3 py-2 border rounded inline-flex items-center gap-2 ${targetTournamentId !== NEW_TOURNEY_SENTINEL ? 'border-zinc-700 text-zinc-500 cursor-not-allowed' : 'border-white hover:bg-white hover:text-black'}`}
+                    title="Upload Entry"
+                    onClick={() => { if (targetTournamentId === NEW_TOURNEY_SENTINEL && uploadRef.current) uploadRef.current.click(); }}
+                    disabled={targetTournamentId !== NEW_TOURNEY_SENTINEL}
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4">
+                      <path d="M12 3a1 1 0 0 1 1 1v8.586l2.293-2.293a1 1 0 1 1 1.414 1.414l-4 4a1 1 0 0 1-1.414 0l-4-4A1 1 0 1 1 8.707 10.293L11 12.586V4a1 1 0 0 1 1-1z"/>
+                      <path d="M4 15a1 1 0 0 1 1-1h2a1 1 0 1 1 0 2H6v2h12v-2h-1a1 1 0 1 1 0-2h2a1 1 0 0 1 1 1v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4z"/>
+                    </svg>
+                    <span>Upload Entry</span>
+                  </button>
+                </div>
+
+                <button
+                  className={`px-3 py-2 border rounded border-white hover:bg-white hover:text-black`}
+                  onClick={targetTournamentId === NEW_TOURNEY_SENTINEL ? loadTeamsFromText : () =>
+                    applyEntriesToTournament(
+                      targetTournamentId,
+                      (builderTeams.length ? builderTeams.map(b => b.name) : namesText.split(/\r?\n/).map(s => s.trim()).filter(Boolean))
+                    )
+                  }
+                >
+                  Add Entries
                 </button>
               </div>
 
-              <button
-                className={`px-3 py-2 border rounded border-white hover:bg-white hover:text-black`}
-                onClick={targetTournamentId === NEW_TOURNEY_SENTINEL ? loadTeamsFromText : () =>
-                  applyEntriesToTournament(
-                    targetTournamentId,
-                    builderTeams.length ? builderTeams.map(b => b.name) : namesText.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
-                  )
-                }
-              >
-                Add Entries
-              </button>
+              {targetTournamentId === NEW_TOURNEY_SENTINEL && (builderTeams || []).length > 0 && (
+                <div className="my-3 grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
+                  {[{ label: "Seed 1", v: seed1, set: setSeed1 }, { label: "Seed 2", v: seed2, set: setSeed2 }, { label: "Seed 3", v: seed3, set: setSeed3 }, { label: "Seed 4", v: seed4, set: setSeed4 }].map((s) => (
+                    <label key={s.label} className="text-xs">{s.label}
+                      <select className="field border rounded p-1 ml-1 w-full" style={{ borderColor: TM_BLUE }} value={s.v} onChange={(e) => s.set(e.target.value)}>
+                        <option value="">—</option>
+                        {(builderTeams || []).map((tm) => (<option key={tm.id} value={tm.name}>{tm.name}</option>))}
+                      </select>
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-6 text-center">
+                <button className="px-4 py-2 border border-emerald-400 text-emerald-300 rounded hover:bg-emerald-400 hover:text-black" onClick={createTournament}>
+                  {targetTournamentId === NEW_TOURNEY_SENTINEL ? 'Create Tournament' : 'Apply Entries to Selected'}
+                </button>
+              </div>
             </div>
 
-            {targetTournamentId === NEW_TOURNEY_SENTINEL && builderTeams.length > 0 && (
-              <div className="my-3 grid grid-cols-2 md:grid-cols-4 gap-4 items-center">
-                {[{ label: "Seed 1", v: seed1, set: setSeed1 }, { label: "Seed 2", v: seed2, set: setSeed2 }, { label: "Seed 3", v: seed3, set: setSeed3 }, { label: "Seed 4", v: seed4, set: setSeed4 }].map((s) => (
-                  <label key={s.label} className="text-xs">{s.label}
-                    <select className="field border rounded p-1 ml-1 w-full" style={{ borderColor: TM_BLUE }} value={s.v} onChange={(e) => s.set(e.target.value)}>
-                      <option value="">—</option>
-                      {builderTeams.map((tm) => (<option key={tm.id} value={tm.name}>{tm.name}</option>))}
-                    </select>
-                  </label>
-                ))}
-              </div>
+            <div className="border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
+              <h2 className="font-semibold mb-3">Tips</h2>
+              <ul className="list-disc ml-5 text-sm text-white/90 space-y-1">
+                <li>Cloud sync uses a Worker proxy to GitHub (configure URL + APP_KEY).</li>
+                <li>Seeds: up to 4; minimum 2 required.</li>
+                <li>Use Bracket View + Print in FIXTURES for a clean printable layout.</li>
+                <li>Delete requires password; moved to admin-only DELETED tab.</li>
+              </ul>
+            </div>
+          </section>
+        ) : (
+          <section className="border rounded-2xl p-6 text-sm glass" style={{ borderColor: TM_BLUE }}>
+            Viewer mode. Please <button className="underline" onClick={() => setShowLogin(true)}>login as Admin</button> to access SCHEDULE.
+          </section>
+        ))}
+
+        {/* FIXTURES */}
+        {tab === "fixtures" && (
+          <section>
+            {activeTournaments.length === 0 && (
+              <p className="text-white/80 text-sm">No active tournaments. {isAdmin ? <>Create one from <b>SCHEDULE</b>.</> : <>Ask an admin to create one.</>}</p>
             )}
 
-            <div className="mt-6 text-center">
-              <button className="px-4 py-2 border border-emerald-400 text-emerald-300 rounded hover:bg-emerald-400 hover:text-black" onClick={createTournament}>
-                {targetTournamentId === NEW_TOURNEY_SENTINEL ? 'Create Tournament' : 'Apply Entries to Selected'}
-              </button>
-            </div>
-          </div>
+            {activeTournaments.map(tn => (
+              <TournamentCard
+                key={tn.id}
+                tn={tn}
+                isAdmin={isAdmin}
+                stageLabelByCount={stageLabelByCount}
+                roundCounts={roundCounts}
+                maxRound={maxRound}
+                canGenerateNext={canGenerateNext}
+                pickWinner={pickWinner}
+                generateNextRound={generateNextRound}
+                openDelete={openDelete}
+              />
+            ))}
+          </section>
+        )}
 
-          <div className="border rounded-2xl p-4 glass" style={{ borderColor: TM_BLUE }}>
-            <h2 className="font-semibold mb-3">Tips</h2>
-            <ul className="list-disc ml-5 text-sm text-white/90 space-y-1">
-              <li>Cloud sync uses a Worker proxy to GitHub (configure URL + APP_KEY).</li>
-              <li>Seeds: up to 4; minimum 2 required.</li>
-              <li>Use Bracket View + Print in FIXTURES for a clean printable layout.</li>
-              <li>Delete requires password; moved to admin-only DELETED tab.</li>
-            </ul>
-          </div>
-        </section>
-      ) : (
-        <section className="border rounded-2xl p-6 text-sm glass" style={{ borderColor: TM_BLUE }}>
-          Viewer mode. Please <button className="underline" onClick={() => setShowLogin(true)}>login as Admin</button> to access SCHEDULE.
-        </section>
-      ))}
+        {/* STANDINGS */}
+        {tab === "standings" && (
+          <section>
+            {(tournaments || []).length === 0 && (
+              <p className="text-white/80 text-sm">No tournaments yet. {isAdmin ? <>Create one from <b>SCHEDULE</b>.</> : <>Ask an admin to create one.</>}</p>
+            )}
 
-      {/* FIXTURES */}
-      {tab === "fixtures" && (
-        <section>
-          {activeTournaments.length === 0 && (
-            <p className="text-white/80 text-sm">No active tournaments. {isAdmin ? <>Create one from <b>SCHEDULE</b>.</> : <>Ask an admin to create one.</>}</p>
-          )}
+            {(tournaments || []).map(tn => {
+              const teamMap = Object.fromEntries((tn.teams || []).map(tm => [tm.id, tm.name]));
+              const byRound = new Map();
+              for (const m of (tn.matches || [])) { if (!byRound.has(m.round)) byRound.set(m.round, []); byRound.get(m.round).push(m); }
+              const ordered = Array.from(byRound.entries()).sort((a, b) => a[0] - b[0]);
+              const mr = (tn.matches || []).length ? Math.max(...(tn.matches || []).map(m => m.round)) : 1;
+              const subtitle = tn.status === "completed"
+                ? `Completed • Champion: ${tn.championId ? (teamMap[tn.championId] || 'TBD') : 'TBD'}`
+                : `Active • Current: ${stageLabelByCount(ordered.find(([r]) => r === mr)?.[1].length || 0) || `Round ${mr}`}`;
+              return (
+                <Collapsible key={tn.id} title={tn.name} subtitle={subtitle} defaultOpen={false}>
+                  {ordered.map(([round, arr]) => (
+                    <div key={round} className="mb-3">
+                      <h3 className="font-semibold mb-1">{stageLabelByCount(arr.length) || `Round ${round}`}</h3>
+                      <ul className="space-y-1 text-sm">
+                        {arr.map((m, i) => {
+                          const a = teamMap[m.aId] || "BYE/TBD";
+                          const b = teamMap[m.bId] || "BYE/TBD";
+                          const w = m.winnerId ? (teamMap[m.winnerId] || "TBD") : null;
+                          const isFinals = (stageLabelByCount(arr.length) === 'Finals');
+                          return (
+                            <li key={m.id}>
+                              {isFinals ? (
+                                <>{a} vs {b} — {w ? <b>{w}</b> : <span className="text-zinc-400">TBD</span>}</>
+                              ) : (
+                                <>Match {i + 1}: {a} vs {b} — {w ? <b>{w}</b> : <span className="text-zinc-400">TBD</span>}</>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  ))}
+                </Collapsible>
+              );
+            })}
+          </section>
+        )}
 
-          {activeTournaments.map(tn => (
-            <TournamentCard
-              key={tn.id}
-              tn={tn}
-              isAdmin={isAdmin}
-              stageLabelByCount={stageLabelByCount}
-              roundCounts={roundCounts}
-              maxRound={maxRound}
-              canGenerateNext={canGenerateNext}
-              pickWinner={pickWinner}
-              generateNextRound={generateNextRound}
-              openDelete={openDelete}
-            />
-          ))}
-        </section>
-      )}
+        {/* WINNERS */}
+        {tab === "winners" && (
+          <section>
+            {completedTournaments.length === 0 && (
+              <p className="text-white/80 text-sm">No completed tournaments yet. Finish one in <b>FIXTURES</b>.</p>
+            )}
 
-      {/* STANDINGS */}
-      {tab === "standings" && (
-        <section>
-          {tournaments.length === 0 && (
-            <p className="text-white/80 text-sm">No tournaments yet. {isAdmin ? <>Create one from <b>SCHEDULE</b>.</> : <>Ask an admin to create one.</>}</p>
-          )}
+            {completedTournaments.map(tn => {
+              const teamMap = Object.fromEntries((tn.teams || []).map(tm => [tm.id, tm.name]));
+              const byRound = new Map();
+              for (const m of (tn.matches || [])) { if (!m.winnerId) continue; if (!byRound.has(m.round)) byRound.set(m.round, []); byRound.get(m.round).push(m); }
+              const ordered = Array.from(byRound.entries()).sort((a, b) => a[0] - b[0]).filter(([_, arr]) => {
+                const label = stageLabelByCount(arr.length);
+                return label === 'Finals' || label === 'Semi Finals';
+              });
+              const championName = tn.championId ? (teamMap[tn.championId] || "TBD") : "TBD";
 
-          {tournaments.map(tn => {
-            const teamMap = Object.fromEntries(tn.teams.map(tm => [tm.id, tm.name]));
-            const byRound = new Map();
-            for (const m of tn.matches) { if (!byRound.has(m.round)) byRound.set(m.round, []); byRound.get(m.round).push(m); }
-            const ordered = Array.from(byRound.entries()).sort((a, b) => a[0] - b[0]);
-            const mr = tn.matches.length ? Math.max(...tn.matches.map(m => m.round)) : 1;
-            const subtitle = tn.status === "completed"
-              ? `Completed • Champion: ${tn.championId ? (teamMap[tn.championId] || 'TBD') : 'TBD'}`
-              : `Active • Current: ${stageLabelByCount(ordered.find(([r]) => r === mr)?.[1].length || 0) || `Round ${mr}`}`;
-            return (
-              <Collapsible key={tn.id} title={tn.name} subtitle={subtitle} defaultOpen={false}>
-                {ordered.map(([round, arr]) => (
-                  <div key={round} className="mb-3">
-                    <h3 className="font-semibold mb-1">{stageLabelByCount(arr.length) || `Round ${round}`}</h3>
-                    <ul className="space-y-1 text-sm">
-                      {arr.map((m, i) => {
-                        const a = teamMap[m.aId] || "BYE/TBD";
-                        const b = teamMap[m.bId] || "BYE/TBD";
-                        const w = m.winnerId ? (teamMap[m.winnerId] || "TBD") : null;
-                        const isFinals = (stageLabelByCount(arr.length) === 'Finals');
-                        return (
-                          <li key={m.id}>
-                            {isFinals ? (
-                              <>{a} vs {b} — {w ? <b>{w}</b> : <span className="text-zinc-400">TBD</span>}</>
-                            ) : (
-                              <>Match {i + 1}: {a} vs {b} — {w ? <b>{w}</b> : <span className="text-zinc-400">TBD</span>}</>
-                            )}
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  </div>
-                ))}
-              </Collapsible>
-            );
-          })}
-        </section>
-      )}
+              return (
+                <Collapsible key={tn.id} title={tn.name} subtitle={`Champion: ${championName}`} defaultOpen={false}>
+                  {ordered.length === 0 ? (
+                    <p className="text-white/80 text-sm">No Semi Finals/Finals recorded yet.</p>
+                  ) : ordered.map(([round, arr]) => (
+                    <div key={round} className="mb-3">
+                      <h3 className="font-semibold mb-1">{stageLabelByCount(arr.length)}</h3>
+                      <ul className="space-y-1 text-sm">
+                        {arr.map((m, i) => {
+                          const a = teamMap[m.aId] || "BYE/TBD";
+                          const b = teamMap[m.bId] || "BYE/TBD";
+                          const w = teamMap[m.winnerId] || "TBD";
+                          return (
+                            <li key={m.id}>
+                              {arr.length === 1 ? (
+                                <>{a} vs {b} — <b>{w}</b></>
+                              ) : (
+                                <>Match {i + 1}: {a} vs {b} — <b>{w}</b></>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  ))}
+                </Collapsible>
+              );
+            })}
+          </section>
+        )}
 
-      {/* WINNERS */}
-      {tab === "winners" && (
-        <section>
-          {completedTournaments.length === 0 && (
-            <p className="text-white/80 text-sm">No completed tournaments yet. Finish one in <b>FIXTURES</b>.</p>
-          )}
+        {/* DELETED (Admin-only) */}
+        {tab === "deleted" && isAdmin && (
+          <section>
+            {(deletedTournaments || []).length === 0 ? (
+              <p className="text-white/80 text-sm">No deleted tournaments.</p>
+            ) : (
+              (deletedTournaments || []).map((tn) => (
+                <Collapsible key={tn.id} title={tn.name} subtitle={`Deleted on ${new Date(tn.deletedAt).toLocaleString()}`} defaultOpen={false}>
+                  <p className="text-sm text-white/70">Players: {(tn.teams || []).length}</p>
+                  <p className="text-sm text-white/70">Matches: {(tn.matches || []).length}</p>
+                </Collapsible>
+              ))
+            )}
+          </section>
+        )}
 
-          {completedTournaments.map(tn => {
-            const teamMap = Object.fromEntries(tn.teams.map(tm => [tm.id, tm.name]));
-            const byRound = new Map();
-            for (const m of tn.matches) { if (!m.winnerId) continue; if (!byRound.has(m.round)) byRound.set(m.round, []); byRound.get(m.round).push(m); }
-            const ordered = Array.from(byRound.entries()).sort((a, b) => a[0] - b[0]).filter(([_, arr]) => {
-              const label = stageLabelByCount(arr.length);
-              return label === 'Finals' || label === 'Semi Finals';
-            });
-            const championName = tn.championId ? (teamMap[tn.championId] || "TBD") : "TBD";
-
-            return (
-              <Collapsible key={tn.id} title={tn.name} subtitle={`Champion: ${championName}`} defaultOpen={false}>
-                {ordered.length === 0 ? (
-                  <p className="text-white/80 text-sm">No Semi Finals/Finals recorded yet.</p>
-                ) : ordered.map(([round, arr]) => (
-                  <div key={round} className="mb-3">
-                    <h3 className="font-semibold mb-1">{stageLabelByCount(arr.length)}</h3>
-                    <ul className="space-y-1 text-sm">
-                      {arr.map((m, i) => {
-                        const a = teamMap[m.aId] || "BYE/TBD";
-                        const b = teamMap[m.bId] || "BYE/TBD";
-                        const w = teamMap[m.winnerId] || "TBD";
-                        return (
-                          <li key={m.id}>
-                            {arr.length === 1 ? (
-                              <>{a} vs {b} — <b>{w}</b></>
-                            ) : (
-                              <>Match {i + 1}: {a} vs {b} — <b>{w}</b></>
-                            )}
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  </div>
-                ))}
-              </Collapsible>
-            );
-          })}
-        </section>
-      )}
-
-      {/* DELETED (Admin-only) */}
-      {tab === "deleted" && isAdmin && (
-        <section>
-          {deletedTournaments.length === 0 ? (
-            <p className="text-white/80 text-sm">No deleted tournaments.</p>
-          ) : (
-            deletedTournaments.map((tn) => (
-              <Collapsible key={tn.id} title={tn.name} subtitle={`Deleted on ${new Date(tn.deletedAt).toLocaleString()}`} defaultOpen={false}>
-                <p className="text-sm text-white/70">Players: {tn.teams.length}</p>
-                <p className="text-sm text-white/70">Matches: {tn.matches.length}</p>
-              </Collapsible>
-            ))
-          )}
-        </section>
-      )}
-
-      {/* FOOTER */}
-      <footer className="fixed bottom-4 right-6 text-2xl font-bold text-white/80">CV ENGG TML</footer>
-    </div>
+        {/* FOOTER */}
+        <footer className="fixed bottom-4 right-6 text-2xl font-bold text-white/80">CV ENGG TML</footer>
+      </div>
+    </ErrorBoundary>
   );
 }
