@@ -1,0 +1,9 @@
+const fs = require("fs");
+const path = require("path");
+const dist = path.join(__dirname, "..", "dist");
+const index = path.join(dist, "index.html");
+const fourOfour = path.join(dist, "404.html");
+if (fs.existsSync(index)) {
+  fs.copyFileSync(index, fourOfour);
+  console.log("Created 404.html for SPA fallback");
+}
